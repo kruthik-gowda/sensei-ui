@@ -27,9 +27,15 @@ Return ONLY minified JSON, no prose, no code fence:
 
 ## Findings
 %(findings)s
-
+%(truncation_notice)s
 ## Diff
 %(diff)s
+"""
+
+TRUNCATION_NOTICE = """
+NOTE: the diff below was truncated because it exceeded the size limit. Some \
+supporting evidence may be missing as a result. Do not reject a finding \
+solely because its supporting context is absent from this truncated diff.
 """
 
 
@@ -75,7 +81,12 @@ def adjudicate(findings: List[Dict], diff_text: str) -> Tuple[List[Dict], str]:
         % (i, f["file"], f.get("line"), f["original_body"].strip())
         for i, f in enumerate(findings)
     )
-    prompt = PROMPT % {"findings": listing, "diff": diff_text[:MAX_DIFF_CHARS]}
+    is_truncated = len(diff_text) > MAX_DIFF_CHARS
+    prompt = PROMPT % {
+        "findings": listing,
+        "truncation_notice": TRUNCATION_NOTICE if is_truncated else "",
+        "diff": diff_text[:MAX_DIFF_CHARS],
+    }
 
     try:
         proc = subprocess.run(
