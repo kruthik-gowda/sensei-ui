@@ -90,7 +90,27 @@ def test_new_line_numbers_agree_with_sensei_extract_diff_lines():
     """Anchor validation and rendering must not disagree about line numbers."""
     from sensei.gitlab_client import extract_diff_lines
 
-    rows = parse_diff(SIMPLE)
-    ours = {r["new_line"] for r in rows if r["kind"] == "add"}
+    for diff_text in (SIMPLE, MULTI_HUNK, NEW_FILE):
+        rows = parse_diff(diff_text)
+        ours = {r["new_line"] for r in rows if r["kind"] == "add"}
 
-    assert ours == extract_diff_lines(SIMPLE)
+        assert ours == extract_diff_lines(diff_text)
+
+
+def test_no_newline_at_eof_marker_produces_no_row():
+    no_newline_diff = """--- a/app.py
++++ b/app.py
+@@ -1,2 +1,2 @@
+ import os
+-old = 1
++new = 2
+\\ No newline at end of file
+"""
+    rows = parse_diff(no_newline_diff)
+
+    assert all("No newline" not in r["text"] for r in rows)
+
+    context = [r for r in rows if r["kind"] == "context"]
+    assert all(
+        r["old_line"] is not None and r["new_line"] is not None for r in context
+    )

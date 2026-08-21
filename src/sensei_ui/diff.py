@@ -24,7 +24,12 @@ def _row(
 
 
 def parse_diff(diff_text: str) -> List[Dict]:
-    """Parse a unified diff into rows. Returns [] for empty input."""
+    """Parse a unified diff into rows. Returns [] for empty input.
+
+    Expects a SINGLE file's diff text (e.g. GitLab's per-file `diff` string),
+    not a whole multi-file patch. Rows carry no filename, so multi-file input
+    produces rows that cannot be attributed back to a specific file.
+    """
     if not diff_text or not diff_text.strip():
         return []
 
@@ -41,6 +46,14 @@ def parse_diff(diff_text: str) -> List[Dict]:
             )
             rows.append(_row("meta", header))
             for line in hunk:
+                if (
+                    not line.is_added
+                    and not line.is_removed
+                    and line.source_line_no is None
+                    and line.target_line_no is None
+                ):
+                    continue
+
                 text = line.value.rstrip("\n")
                 if line.is_added:
                     rows.append(_row("add", text, None, line.target_line_no))
