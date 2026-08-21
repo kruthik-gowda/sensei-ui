@@ -10,6 +10,7 @@ from sensei_ui import engine, setup, verify
 from sensei_ui.store import Store
 
 DB_PATH = os.path.expanduser("~/.sensei-ui/ui.db")
+ALLOWED_FINDING_STATES = frozenset({"pending", "kept", "discarded", "posted"})
 
 
 class FindingPatch(BaseModel):
@@ -92,6 +93,15 @@ def create_app(store: Optional[Store] = None) -> FastAPI:
 
     @app.patch("/api/findings/{finding_id}")
     def patch_finding(finding_id: int, patch: FindingPatch) -> Dict:
+        if patch.state is not None and patch.state not in ALLOWED_FINDING_STATES:
+            raise HTTPException(
+                status_code=422,
+                detail="invalid state %r, must be one of %s"
+                % (patch.state, sorted(ALLOWED_FINDING_STATES)),
+            )
+        if app.state.store.get_finding(finding_id) is None:
+            raise HTTPException(status_code=404, detail="finding not found")
+
         app.state.store.update_finding(
             finding_id, patch.edited_body, patch.state
         )
@@ -103,15 +113,16 @@ def create_app(store: Optional[Store] = None) -> FastAPI:
         if not run:
             raise HTTPException(status_code=404, detail="run not found")
 
-        if current_head_sha(run["mr_url"]) != run["head_sha"]:
+        client = engine.make_client(run["mr_url"])
+        mr_data = client.get_mr_diff(run["project_path"], run["mr_iid"])
+
+        if mr_data["head_sha"] != run["head_sha"]:
             raise HTTPException(
                 status_code=409,
                 detail="Review is stale: the MR has new commits since"
                 " %s. Re-review before posting." % run["head_sha"][:8],
             )
 
-        client = engine.make_client(run["mr_url"])
-        mr_data = client.get_mr_diff(run["project_path"], run["mr_iid"])
         diff_lines_map = {
             f["new_path"]: engine.extract_diff_lines(f["diff"])
             for f in mr_data["files"]

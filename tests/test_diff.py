@@ -86,6 +86,15 @@ def test_empty_diff_returns_no_rows():
     assert parse_diff("") == []
 
 
+def test_header_less_hunk_parses_like_gitlab_per_file_diff():
+    """GitLab's per-file `diff` field is hunks only, with no ---/+++ lines."""
+    rows = parse_diff("@@ -1,1 +1,2 @@\n ctx\n+added\n")
+    added = [r for r in rows if r["kind"] == "add"]
+
+    assert added[0]["text"] == "added"
+    assert added[0]["new_line"] == 2
+
+
 def test_new_line_numbers_agree_with_sensei_extract_diff_lines():
     """Anchor validation and rendering must not disagree about line numbers."""
     from sensei.gitlab_client import extract_diff_lines

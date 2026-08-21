@@ -60,12 +60,17 @@ def to_findings(comments: List[Dict]) -> List[Dict]:
 
 def generate(mr_url: str) -> Dict:
     """Run sensei in dry-run mode and load the snapshot it writes."""
-    proc = subprocess.run(
-        ["sensei", "review", mr_url, "--dry-run", "--fresh"],
-        capture_output=True,
-        text=True,
-        timeout=GENERATE_TIMEOUT,
-    )
+    try:
+        proc = subprocess.run(
+            ["sensei", "review", mr_url, "--dry-run", "--fresh"],
+            capture_output=True,
+            text=True,
+            timeout=GENERATE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        raise EngineError(
+            "sensei review timed out after %d seconds" % GENERATE_TIMEOUT
+        )
     if proc.returncode != 0:
         tail = ((proc.stdout or "") + (proc.stderr or ""))[-500:]
         raise EngineError("sensei review failed: %s" % tail)

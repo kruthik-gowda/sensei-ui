@@ -1,4 +1,8 @@
-from sensei_ui.engine import snapshot_path, to_findings
+import subprocess
+
+import pytest
+
+from sensei_ui.engine import EngineError, generate, snapshot_path, to_findings
 
 
 def test_snapshot_path_matches_sensei_naming():
@@ -40,3 +44,15 @@ def test_signatures_are_stored_as_strings():
 
 def test_empty_comment_list_yields_no_findings():
     assert to_findings([]) == []
+
+
+def test_generate_raises_engine_error_on_timeout(monkeypatch):
+    """A hung `sensei review` must surface as a clean 502, not a bare 500."""
+
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="sensei", timeout=900)
+
+    monkeypatch.setattr("sensei_ui.engine.subprocess.run", fake_run)
+
+    with pytest.raises(EngineError, match="timed out"):
+        generate("https://gitlab.example.com/g/p/-/merge_requests/7")
