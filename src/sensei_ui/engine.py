@@ -194,12 +194,17 @@ def post_planned(
 
 
 def delete_discussions(client, project_path: str, mr_iid: int, ids: List[str]) -> int:
-    """Undo: remove threads and notes this app created."""
+    """Undo: remove threads and notes this app created.
+
+    A single summary note is recorded under the same id for every finding it
+    covers, so `ids` can contain repeats; dedupe here rather than trust every
+    future caller to do it before the second delete 404s.
+    """
     project = client.gl.projects.get(project_path)
     mr = project.mergerequests.get(mr_iid)
     removed = 0
 
-    for discussion_id in ids:
+    for discussion_id in dict.fromkeys(ids):
         if discussion_id.startswith("note-"):
             mr.notes.delete(int(discussion_id[len("note-"):]))
             removed += 1
