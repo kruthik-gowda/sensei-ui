@@ -126,3 +126,18 @@ def test_set_run_test_summary_round_trips(store):
     store.set_run_test_summary(run_id, '{"covered": 3}')
 
     assert store.get_run(run_id)["test_summary"] == '{"covered": 3}'
+
+
+def test_finding_missing_from_the_next_generation_drops_out(store):
+    """A kept finding the author has since fixed must not linger as postable."""
+    run_id = store.get_or_create_run("g/p", 7, "https://x/7", "sha-1")
+    store.upsert_findings(run_id, [_finding("sig-stale"), _finding("sig-live")])
+    for finding in store.list_findings(run_id):
+        store.update_finding(finding["id"], None, "kept")
+
+    same_run = store.get_or_create_run("g/p", 7, "https://x/7", "sha-2")
+    store.upsert_findings(same_run, [_finding("sig-live")])
+
+    remaining = store.list_findings(run_id)
+    assert [f["signature"] for f in remaining] == ["sig-live"]
+    assert remaining[0]["state"] == "kept"

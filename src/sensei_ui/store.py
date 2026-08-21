@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS run (
     created_at    TEXT NOT NULL,
     status        TEXT NOT NULL,
     verify_status TEXT NOT NULL,
-    test_summary  TEXT
+    test_summary  TEXT,
+    generation    INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS finding (
@@ -37,7 +38,8 @@ CREATE TABLE IF NOT EXISTS finding (
     verdict        TEXT,
     verdict_reason TEXT,
     discussion_id  TEXT,
-    posted_at      TEXT
+    posted_at      TEXT,
+    last_seen_generation INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS finding_run_signature
@@ -63,12 +65,27 @@ class Store:
             self.conn.commit()
 
     def _migrate(self) -> None:
-        columns = {
+        run_columns = {
             row["name"]
             for row in self.conn.execute("PRAGMA table_info(run)").fetchall()
         }
-        if "test_summary" not in columns:
+        if "test_summary" not in run_columns:
             self.conn.execute("ALTER TABLE run ADD COLUMN test_summary TEXT")
+        if "generation" not in run_columns:
+            self.conn.execute(
+                "ALTER TABLE run ADD COLUMN generation INTEGER NOT NULL"
+                " DEFAULT 0"
+            )
+
+        finding_columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(finding)").fetchall()
+        }
+        if "last_seen_generation" not in finding_columns:
+            self.conn.execute(
+                "ALTER TABLE finding ADD COLUMN last_seen_generation"
+                " INTEGER NOT NULL DEFAULT 0"
+            )
 
     def close(self) -> None:
         self.conn.close()
@@ -92,8 +109,8 @@ class Store:
             if row is None:
                 cur = self.conn.execute(
                     "INSERT INTO run (project_path, mr_iid, mr_url, head_sha,"
-                    " created_at, status, verify_status)"
-                    " VALUES (?, ?, ?, ?, ?, 'running', 'skipped')",
+                    " created_at, status, verify_status, generation)"
+                    " VALUES (?, ?, ?, ?, ?, 'running', 'skipped', 1)",
                     (project_path, mr_iid, mr_url, head_sha, _now()),
                 )
                 self.conn.commit()
@@ -102,7 +119,8 @@ class Store:
             run_id = int(row["id"])
             self.conn.execute(
                 "UPDATE run SET mr_url = ?, head_sha = ?, status = 'running',"
-                " verify_status = 'skipped' WHERE id = ?",
+                " verify_status = 'skipped', generation = generation + 1"
+                " WHERE id = ?",
                 (mr_url, head_sha, run_id),
             )
             self.conn.commit()
@@ -140,18 +158,27 @@ class Store:
 
         Reviewer-owned columns (edited_body, state, discussion_id, posted_at)
         are deliberately left untouched so decisions survive regeneration.
+
+        Each finding is stamped with the run's current generation. A finding
+        the latest generation did not produce keeps its old stamp and drops out
+        of `list_findings` — otherwise a kept finding whose problem the author
+        has since fixed would still be posted, which is the exact failure this
+        tool exists to prevent.
         """
         with self._lock:
+            generation = self._current_generation(run_id)
             for f in findings:
                 self.conn.execute(
                     "INSERT INTO finding (run_id, signature, file, line, kind,"
-                    " confidence, original_body, state, verdict, verdict_reason)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)"
+                    " confidence, original_body, state, verdict, verdict_reason,"
+                    " last_seen_generation)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)"
                     " ON CONFLICT(run_id, signature) DO UPDATE SET"
                     "   original_body = excluded.original_body,"
                     "   confidence    = excluded.confidence,"
                     "   verdict       = excluded.verdict,"
-                    "   verdict_reason = excluded.verdict_reason",
+                    "   verdict_reason = excluded.verdict_reason,"
+                    "   last_seen_generation = excluded.last_seen_generation",
                     (
                         run_id,
                         f["signature"],
@@ -162,15 +189,27 @@ class Store:
                         f["original_body"],
                         f.get("verdict"),
                         f.get("verdict_reason"),
+                        generation,
                     ),
                 )
             self.conn.commit()
 
+    def _current_generation(self, run_id: int) -> int:
+        """Caller must hold self._lock."""
+        row = self.conn.execute(
+            "SELECT generation FROM run WHERE id = ?", (run_id,)
+        ).fetchone()
+        return int(row["generation"]) if row else 0
+
     def list_findings(self, run_id: int) -> List[Dict]:
+        """Findings the latest generation produced. Stale ones are excluded."""
         with self._lock:
+            generation = self._current_generation(run_id)
             rows = self.conn.execute(
-                "SELECT * FROM finding WHERE run_id = ? ORDER BY file, line, id",
-                (run_id,),
+                "SELECT * FROM finding WHERE run_id = ?"
+                " AND last_seen_generation = ?"
+                " ORDER BY file, line, id",
+                (run_id, generation),
             ).fetchall()
             return [dict(r) for r in rows]
 

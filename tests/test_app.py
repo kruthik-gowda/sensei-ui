@@ -372,3 +372,42 @@ def test_concurrent_posts_produce_exactly_one_set_of_posts(client, monkeypatch):
 
     assert sum(r["posted"] for r in results) == 1
     assert sorted(planned_counts) == [0, 1]
+
+
+def test_kept_finding_absent_from_latest_generation_is_not_posted(
+    client, monkeypatch
+):
+    """The 2026-08-21 failure in miniature: never comment on fixed code."""
+    _stub_generate(monkeypatch, [_generated("sig-stale"), _generated("sig-live")])
+    store = client.app.state.store
+
+    run_id = client.post("/api/runs", json={"mr_url": "https://x/7"}).json()[
+        "run_id"
+    ]
+    for finding in store.list_findings(run_id):
+        client.patch("/api/findings/%d" % finding["id"], json={"state": "kept"})
+
+    _stub_generate(monkeypatch, [_generated("sig-live")], head_sha="same-sha")
+    client.post("/api/runs", json={"mr_url": "https://x/7"})
+
+    monkeypatch.setattr(
+        "sensei_ui.app.engine.make_client", lambda url: _MatchingHeadClient()
+    )
+    captured = {}
+
+    def fake_post_planned(
+        client_arg, project_path, mr_iid, diff_refs, planned, on_posted
+    ):
+        captured["planned"] = planned
+        return {"posted": 0, "skipped": 0}
+
+    monkeypatch.setattr("sensei_ui.app.engine.post_planned", fake_post_planned)
+
+    assert client.post("/api/runs/%d/post" % run_id).status_code == 200
+
+    planned = captured["planned"]
+    signatures = [
+        e["signature"]
+        for e in planned["inline"] + planned["summary"] + planned["skipped"]
+    ]
+    assert signatures == ["sig-live"]
