@@ -4,6 +4,7 @@ Everything here composes sensei's *public* API. Its private orchestration
 (`cli._post_review_results`) is deliberately not used: it discards the created
 discussion id, which undo and partial-failure recovery both require.
 """
+import hashlib
 import json
 import os
 import subprocess
@@ -34,18 +35,51 @@ def _serialise_signature(signature_tuple) -> str:
     return "|".join(str(part) for part in signature_tuple)
 
 
+def _body_digest(body: str) -> str:
+    """Stable short hash of the *normalised* body.
+
+    Normalising first means whitespace churn in regenerated text does not mint
+    a new storage identity and orphan the reviewer's decision.
+    """
+    _, normalised = build_body_signature(body)
+    return hashlib.sha256(normalised.encode("utf-8")).hexdigest()[:16]
+
+
+def build_storage_signature(dedup_key, body: str) -> str:
+    """Storage identity: unique per finding, not per anchor.
+
+    Two `must` findings on the same file and line share a dedup key. If they
+    also shared a stored signature the store's UPSERT would silently drop one,
+    so the body digest is appended to keep them distinct rows.
+    """
+    return "%s#%s" % (_serialise_signature(dedup_key), _body_digest(body))
+
+
+def dedup_key_for(finding: Dict):
+    """Remote identity: exactly what `get_existing_comments` returns.
+
+    Derived from the finding's own fields rather than parsed back out of the
+    stored signature, which no longer describes the remote anchor alone.
+    """
+    line = finding.get("line")
+    if line:
+        return build_inline_signature(finding["file"], line)
+    return build_body_signature(finding.get("original_body", ""))
+
+
 def to_findings(comments: List[Dict]) -> List[Dict]:
     """Convert sensei snapshot comments into store-shaped findings."""
     findings = []
     for c in comments:
         line = c.get("line") or 0
+        body = c.get("body", "")
         if line > 0:
-            signature = build_inline_signature(c["file"], line)
+            dedup_key = build_inline_signature(c["file"], line)
         else:
-            signature = build_body_signature(c.get("body", ""))
+            dedup_key = build_body_signature(body)
         findings.append(
             {
-                "signature": _serialise_signature(signature),
+                "signature": build_storage_signature(dedup_key, body),
                 "file": c["file"],
                 "line": line or None,
                 "kind": c.get("type", "nit"),
@@ -115,13 +149,6 @@ def make_client(mr_url: str):
     return GitLabClient(config["gitlab_url"], config["gitlab_pat"])
 
 
-def _deserialise_signature(signature: str):
-    parts = signature.split("|")
-    if parts[0] == "inline":
-        return ("inline", parts[1], int(parts[2]))
-    return ("body", "|".join(parts[1:]))
-
-
 def _body_of(finding: Dict) -> str:
     return finding.get("edited_body") or finding["original_body"]
 
@@ -133,8 +160,7 @@ def plan_posts(
     inline, summary, skipped = [], [], []
 
     for finding in findings:
-        signature = _deserialise_signature(finding["signature"])
-        if signature in existing:
+        if dedup_key_for(finding) in existing:
             skipped.append(finding)
             continue
 

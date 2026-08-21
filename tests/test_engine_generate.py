@@ -18,7 +18,7 @@ def test_inline_finding_gets_inline_signature():
           "confidence": 95, "body": "problem here"}]
     )
 
-    assert findings[0]["signature"] == "inline|a.py|10"
+    assert findings[0]["signature"].startswith("inline|a.py|10#")
     assert findings[0]["kind"] == "must"
     assert findings[0]["original_body"] == "problem here"
 
@@ -29,7 +29,7 @@ def test_finding_without_line_gets_body_signature():
           "confidence": 85, "body": "  spaced   out  "}]
     )
 
-    assert findings[0]["signature"] == "body|spaced out"
+    assert findings[0]["signature"].startswith("body|spaced out#")
 
 
 def test_signatures_are_stored_as_strings():
@@ -40,6 +40,18 @@ def test_signatures_are_stored_as_strings():
     )
 
     assert isinstance(findings[0]["signature"], str)
+
+
+def test_two_findings_on_the_same_line_are_not_collapsed():
+    """Two `must` findings on one line must reach the store as two rows."""
+    findings = to_findings(
+        [{"file": "a.py", "line": 42, "type": "must",
+          "confidence": 95, "body": "first problem"},
+         {"file": "a.py", "line": 42, "type": "must",
+          "confidence": 90, "body": "second problem"}]
+    )
+
+    assert len({f["signature"] for f in findings}) == 2
 
 
 def test_empty_comment_list_yields_no_findings():

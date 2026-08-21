@@ -1,6 +1,6 @@
 from sensei.gitlab_client import build_body_signature
 
-from sensei_ui.engine import _deserialise_signature, _serialise_signature, plan_posts
+from sensei_ui.engine import build_storage_signature, dedup_key_for, plan_posts
 
 
 def _f(signature, file="a.py", line=10, kind="must", body="text"):
@@ -56,13 +56,53 @@ def test_unedited_finding_posts_original_body():
     assert plan["inline"][0]["body"] == "original"
 
 
-def test_body_signature_with_pipe_characters_round_trips():
-    original = build_body_signature("| col1 | col2 |\n> quoted | diff | line")
+def test_body_signature_with_pipe_characters_still_dedupes():
+    """A markdown table body is full of `|`; the remote key must survive it.
 
-    serialised = _serialise_signature(original)
-    deserialised = _deserialise_signature(serialised)
+    The dedup key is now derived from the finding's own fields rather than
+    parsed out of the stored signature, so this asserts the property the old
+    round-trip test protected: a pipe-heavy body GitLab already carries is
+    recognised and skipped.
+    """
+    body = "| col1 | col2 |\n> quoted | diff | line"
+    finding = _f(
+        build_storage_signature(build_body_signature(body), body),
+        kind="nit", line=None, body=body,
+    )
 
-    assert deserialised == original
+    assert dedup_key_for(finding) == build_body_signature(body)
+
+    plan = plan_posts([finding], {}, {build_body_signature(body)})
+
+    assert plan["summary"] == []
+    assert len(plan["skipped"]) == 1
+
+
+def test_two_findings_on_one_line_get_distinct_storage_signatures():
+    """Storage identity is per finding; remote identity is per anchor."""
+    key = ("inline", "a.py", 42)
+
+    first = build_storage_signature(key, "first problem")
+    second = build_storage_signature(key, "second problem")
+
+    assert first != second
+    assert first.startswith("inline|a.py|42#")
+    assert second.startswith("inline|a.py|42#")
+
+
+def test_storage_signature_is_stable_across_whitespace_churn():
+    """Reformatting regenerated text must not orphan a reviewer decision."""
+    key = ("inline", "a.py", 42)
+
+    assert build_storage_signature(key, "same  words   here") == (
+        build_storage_signature(key, "same words here")
+    )
+
+
+def test_dedup_key_for_inline_finding_ignores_body():
+    finding = _f("inline|a.py|10#deadbeef", body="anything at all")
+
+    assert dedup_key_for(finding) == ("inline", "a.py", 10)
 
 
 class _FakeNotes:
