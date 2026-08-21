@@ -138,6 +138,33 @@ def create_app(store: Optional[Store] = None) -> FastAPI:
         with _post_lock(run_id):
             return _post_run_locked(run_id)
 
+    @app.post("/api/runs/{run_id}/unpost")
+    def unpost_run(run_id: int) -> Dict:
+        """Delete the threads this run created and return them to `kept`.
+
+        Shares the post lock so an undo cannot interleave with a post.
+        """
+        run = app.state.store.get_run(run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail="run not found")
+
+        with _post_lock(run_id):
+            posted = app.state.store.list_posted_findings(run_id)
+            if not posted:
+                return {"removed": 0, "restored": 0}
+
+            client = engine.make_client(run["mr_url"])
+            removed = engine.delete_discussions(
+                client,
+                run["project_path"],
+                run["mr_iid"],
+                [f["discussion_id"] for f in posted],
+            )
+            for finding in posted:
+                app.state.store.mark_unposted(finding["id"])
+
+            return {"removed": removed, "restored": len(posted)}
+
     def _post_run_locked(run_id: int) -> Dict:
         run = app.state.store.get_run(run_id)
         if not run:

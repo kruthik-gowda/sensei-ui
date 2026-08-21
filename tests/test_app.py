@@ -411,3 +411,96 @@ def test_kept_finding_absent_from_latest_generation_is_not_posted(
         for e in planned["inline"] + planned["summary"] + planned["skipped"]
     ]
     assert signatures == ["sig-live"]
+
+
+def test_unpost_deletes_threads_and_restores_findings(client, monkeypatch):
+    """Undo is what lets a reviewer post without hesitating."""
+    run_id = _seed_postable_run(client, ["kept"])
+    store = client.app.state.store
+    monkeypatch.setattr(
+        "sensei_ui.app.engine.make_client", lambda url: _MatchingHeadClient()
+    )
+
+    def fake_post_planned(
+        client_arg, project_path, mr_iid, diff_refs, planned, on_posted
+    ):
+        entries = planned["inline"] + planned["summary"]
+        for entry in entries:
+            on_posted(entry, "disc-%d" % entry["id"])
+        return {"posted": len(entries), "skipped": 0}
+
+    monkeypatch.setattr("sensei_ui.app.engine.post_planned", fake_post_planned)
+    client.post("/api/runs/%d/post" % run_id)
+    assert store.list_posted_findings(run_id)
+
+    deleted = {}
+
+    def fake_delete(client_arg, project_path, mr_iid, ids):
+        deleted["ids"] = ids
+        return len(ids)
+
+    monkeypatch.setattr("sensei_ui.app.engine.delete_discussions", fake_delete)
+
+    body = client.post("/api/runs/%d/unpost" % run_id).json()
+
+    assert body == {"removed": 1, "restored": 1}
+    assert deleted["ids"] == ["disc-%d" % store.list_findings(run_id)[0]["id"]]
+    restored = store.list_findings(run_id)[0]
+    assert restored["state"] == "kept"
+    assert restored["discussion_id"] is None
+    assert restored["posted_at"] is None
+
+
+def test_unpost_reaches_comments_posted_under_an_earlier_generation(
+    client, monkeypatch
+):
+    """A comment is on the MR whether or not the latest run still reports it."""
+    _stub_generate(monkeypatch, [_generated("sig-1")])
+    run_id = client.post("/api/runs", json={"mr_url": "https://x/7"}).json()[
+        "run_id"
+    ]
+    store = client.app.state.store
+    finding_id = store.list_findings(run_id)[0]["id"]
+    store.mark_posted(finding_id, "disc-old")
+
+    # A later review no longer reports it, so list_findings hides it.
+    _stub_generate(monkeypatch, [_generated("sig-2")], head_sha="same-sha")
+    client.post("/api/runs", json={"mr_url": "https://x/7"})
+    assert [f["signature"] for f in store.list_findings(run_id)] == ["sig-2"]
+
+    deleted = {}
+
+    def fake_delete(client_arg, project_path, mr_iid, ids):
+        deleted["ids"] = ids
+        return len(ids)
+
+    monkeypatch.setattr(
+        "sensei_ui.app.engine.make_client", lambda url: _MatchingHeadClient()
+    )
+    monkeypatch.setattr("sensei_ui.app.engine.delete_discussions", fake_delete)
+
+    body = client.post("/api/runs/%d/unpost" % run_id).json()
+
+    assert deleted["ids"] == ["disc-old"]
+    assert body == {"removed": 1, "restored": 1}
+
+
+def test_unpost_with_nothing_posted_is_a_no_op(client, monkeypatch):
+    run_id = _seed_postable_run(client, ["kept"])
+    called = {"delete": False}
+
+    def fake_delete(*args, **kwargs):
+        called["delete"] = True
+        return 0
+
+    monkeypatch.setattr("sensei_ui.app.engine.delete_discussions", fake_delete)
+
+    assert client.post("/api/runs/%d/unpost" % run_id).json() == {
+        "removed": 0,
+        "restored": 0,
+    }
+    assert called["delete"] is False
+
+
+def test_unpost_unknown_run_returns_404(client):
+    assert client.post("/api/runs/999/unpost").status_code == 404

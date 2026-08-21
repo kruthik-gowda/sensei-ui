@@ -239,6 +239,31 @@ class Store:
                 )
             self.conn.commit()
 
+    def list_posted_findings(self, run_id: int) -> List[Dict]:
+        """Every posted finding for this run, regardless of generation.
+
+        Deliberately not generation-filtered, unlike `list_findings`: a comment
+        posted under an earlier generation still exists on the merge request,
+        so undo has to be able to reach it.
+        """
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM finding WHERE run_id = ? AND state = 'posted'"
+                " AND discussion_id IS NOT NULL ORDER BY id",
+                (run_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def mark_unposted(self, finding_id: int) -> None:
+        """Return a posted finding to `kept` and forget where it landed."""
+        with self._lock:
+            self.conn.execute(
+                "UPDATE finding SET state = 'kept', discussion_id = NULL,"
+                " posted_at = NULL WHERE id = ?",
+                (finding_id,),
+            )
+            self.conn.commit()
+
     def mark_posted(self, finding_id: int, discussion_id: str) -> None:
         with self._lock:
             self.conn.execute(
