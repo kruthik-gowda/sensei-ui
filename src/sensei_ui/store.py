@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS run (
     head_sha      TEXT NOT NULL,
     created_at    TEXT NOT NULL,
     status        TEXT NOT NULL,
-    verify_status TEXT NOT NULL
+    verify_status TEXT NOT NULL,
+    test_summary  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS finding (
@@ -58,23 +59,64 @@ class Store:
         self._lock = threading.Lock()
         with self._lock:
             self.conn.executescript(SCHEMA)
+            self._migrate()
             self.conn.commit()
+
+    def _migrate(self) -> None:
+        columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(run)").fetchall()
+        }
+        if "test_summary" not in columns:
+            self.conn.execute("ALTER TABLE run ADD COLUMN test_summary TEXT")
 
     def close(self) -> None:
         self.conn.close()
 
-    def create_run(
+    def get_or_create_run(
         self, project_path: str, mr_iid: int, mr_url: str, head_sha: str
     ) -> int:
+        """Return the run for this merge request, creating it only once.
+
+        A merge request owns exactly one run row. Re-reviewing repoints that
+        row at the new head SHA and resets its progress fields, which is what
+        keeps the finding table's (run_id, signature) merge — and therefore
+        every reviewer decision — alive across regeneration.
+        """
         with self._lock:
-            cur = self.conn.execute(
-                "INSERT INTO run (project_path, mr_iid, mr_url, head_sha,"
-                " created_at, status, verify_status)"
-                " VALUES (?, ?, ?, ?, ?, 'running', 'skipped')",
-                (project_path, mr_iid, mr_url, head_sha, _now()),
+            row = self.conn.execute(
+                "SELECT id FROM run WHERE project_path = ? AND mr_iid = ?"
+                " ORDER BY id DESC LIMIT 1",
+                (project_path, mr_iid),
+            ).fetchone()
+            if row is None:
+                cur = self.conn.execute(
+                    "INSERT INTO run (project_path, mr_iid, mr_url, head_sha,"
+                    " created_at, status, verify_status)"
+                    " VALUES (?, ?, ?, ?, ?, 'running', 'skipped')",
+                    (project_path, mr_iid, mr_url, head_sha, _now()),
+                )
+                self.conn.commit()
+                return int(cur.lastrowid)
+
+            run_id = int(row["id"])
+            self.conn.execute(
+                "UPDATE run SET mr_url = ?, head_sha = ?, status = 'running',"
+                " verify_status = 'skipped' WHERE id = ?",
+                (mr_url, head_sha, run_id),
             )
             self.conn.commit()
-            return int(cur.lastrowid)
+            return run_id
+
+    def set_run_test_summary(
+        self, run_id: int, test_summary: Optional[str]
+    ) -> None:
+        with self._lock:
+            self.conn.execute(
+                "UPDATE run SET test_summary = ? WHERE id = ?",
+                (test_summary, run_id),
+            )
+            self.conn.commit()
 
     def set_run_status(
         self, run_id: int, status: str, verify_status: str

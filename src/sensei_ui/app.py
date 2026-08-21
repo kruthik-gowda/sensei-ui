@@ -1,5 +1,7 @@
 """FastAPI application wiring the modules together."""
+import json
 import os
+import threading
 from typing import Dict, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -10,7 +12,34 @@ from sensei_ui import engine, setup, verify
 from sensei_ui.store import Store
 
 DB_PATH = os.path.expanduser("~/.sensei-ui/ui.db")
-ALLOWED_FINDING_STATES = frozenset({"pending", "kept", "discarded", "posted"})
+ALLOWED_FINDING_STATES = frozenset({"pending", "kept", "discarded"})
+
+_POST_LOCKS: Dict[int, threading.Lock] = {}
+_POST_LOCKS_GUARD = threading.Lock()
+
+
+def _post_lock(run_id: int) -> threading.Lock:
+    """One lock per run, held across the whole read-plan-post-mark sequence.
+
+    Sync endpoints run on uvicorn's threadpool, so a double-clicked Post can
+    have two requests read the same kept list before either marks anything
+    posted. The store's per-method lock cannot span that sequence.
+    """
+    with _POST_LOCKS_GUARD:
+        lock = _POST_LOCKS.get(run_id)
+        if lock is None:
+            lock = threading.Lock()
+            _POST_LOCKS[run_id] = lock
+        return lock
+
+
+def _decode_test_summary(raw: Optional[str]):
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return raw
 
 
 class FindingPatch(BaseModel):
@@ -37,7 +66,7 @@ def create_app(store: Optional[Store] = None) -> FastAPI:
         except engine.EngineError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
 
-        run_id = app.state.store.create_run(
+        run_id = app.state.store.get_or_create_run(
             generated["project_path"],
             generated["mr_iid"],
             request.mr_url,
@@ -56,6 +85,11 @@ def create_app(store: Optional[Store] = None) -> FastAPI:
             raise
 
         app.state.store.upsert_findings(run_id, annotated)
+        test_summary = generated.get("test_summary")
+        app.state.store.set_run_test_summary(
+            run_id,
+            None if test_summary is None else json.dumps(test_summary),
+        )
         app.state.store.set_run_status(run_id, "complete", verify_status)
         return {"run_id": run_id, "verify_status": verify_status}
 
@@ -74,10 +108,13 @@ def create_app(store: Optional[Store] = None) -> FastAPI:
             }
             for f in mr_data["files"]
         ]
+        test_summary = _decode_test_summary(run.get("test_summary"))
+        run = dict(run, test_summary=test_summary)
         return {
             "run": run,
             "findings": app.state.store.list_findings(run_id),
             "files": files,
+            "test_summary": test_summary,
         }
 
     @app.patch("/api/findings/{finding_id}")
@@ -98,6 +135,10 @@ def create_app(store: Optional[Store] = None) -> FastAPI:
 
     @app.post("/api/runs/{run_id}/post")
     def post_run(run_id: int) -> Dict:
+        with _post_lock(run_id):
+            return _post_run_locked(run_id)
+
+    def _post_run_locked(run_id: int) -> Dict:
         run = app.state.store.get_run(run_id)
         if not run:
             raise HTTPException(status_code=404, detail="run not found")

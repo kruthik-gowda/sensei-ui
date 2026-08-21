@@ -42,7 +42,7 @@ def test_unknown_run_returns_404(client):
 def test_get_run_returns_parsed_files(client, monkeypatch):
     """The spec's API contract is run + findings + parsed diff."""
     store = client.app.state.store
-    run_id = store.create_run("g/p", 7, "https://x/7", "abc")
+    run_id = store.get_or_create_run("g/p", 7, "https://x/7", "abc")
 
     class FakeClient:
         def get_mr_diff(self, project_path, mr_iid):
@@ -60,7 +60,7 @@ def test_get_run_returns_parsed_files(client, monkeypatch):
 
 def test_patch_updates_finding_state(client, tmp_path):
     store = client.app.state.store
-    run_id = store.create_run("g/p", 7, "https://x/7", "abc")
+    run_id = store.get_or_create_run("g/p", 7, "https://x/7", "abc")
     store.upsert_findings(run_id, [{
         "signature": "inline|a.py|1", "file": "a.py", "line": 1,
         "kind": "must", "confidence": 90, "original_body": "b",
@@ -81,7 +81,7 @@ def test_patch_updates_finding_state(client, tmp_path):
 
 def test_patch_rejects_unknown_state(client):
     store = client.app.state.store
-    run_id = store.create_run("g/p", 7, "https://x/7", "abc")
+    run_id = store.get_or_create_run("g/p", 7, "https://x/7", "abc")
     store.upsert_findings(run_id, [{
         "signature": "inline|a.py|1", "file": "a.py", "line": 1,
         "kind": "must", "confidence": 90, "original_body": "b",
@@ -106,7 +106,7 @@ def test_patch_unknown_finding_returns_404(client):
 def test_posting_blocked_when_run_is_stale(client, monkeypatch):
     """Staleness is a hard block — this is the plan's most important rule."""
     store = client.app.state.store
-    run_id = store.create_run("g/p", 7, "https://x/7", "old-sha")
+    run_id = store.get_or_create_run("g/p", 7, "https://x/7", "old-sha")
 
     class FakeClient:
         def get_mr_diff(self, project_path, mr_iid):
@@ -139,7 +139,7 @@ def test_posting_proceeds_when_head_matches(client, monkeypatch):
     not be rejected, and must post using the SAME mr_data that was checked
     (no second, possibly-newer fetch)."""
     store = client.app.state.store
-    run_id = store.create_run("g/p", 7, "https://x/7", "same-sha")
+    run_id = store.get_or_create_run("g/p", 7, "https://x/7", "same-sha")
     store.upsert_findings(run_id, [{
         "signature": "inline|a.py|1", "file": "a.py", "line": 1,
         "kind": "must", "confidence": 90, "original_body": "b",
@@ -184,3 +184,191 @@ def test_posting_proceeds_when_head_matches(client, monkeypatch):
         "base_sha": "b", "head_sha": "same-sha", "start_sha": "s",
     }
     assert fake_client.get_mr_diff_calls == 1
+
+
+def _stub_generate(monkeypatch, findings, test_summary=None, head_sha="sha-1"):
+    monkeypatch.setattr(
+        "sensei_ui.app.engine.generate",
+        lambda mr_url: {
+            "project_path": "g/p",
+            "mr_iid": 7,
+            "head_sha": head_sha,
+            "findings": findings,
+            "test_summary": test_summary,
+            "files": [],
+            "diff_refs": {},
+        },
+    )
+    monkeypatch.setattr(
+        "sensei_ui.app.verify.adjudicate", lambda findings, diff: (findings, "ok")
+    )
+
+
+def _generated(signature, body="generated body"):
+    return {
+        "signature": signature, "file": "a.py", "line": 1, "kind": "must",
+        "confidence": 90, "original_body": body,
+        "verdict": None, "verdict_reason": None,
+    }
+
+
+def test_rerun_of_the_same_mr_preserves_edits_and_discards(client, monkeypatch):
+    """The whole point of the store: re-reviewing must not wipe triage."""
+    _stub_generate(monkeypatch, [_generated("sig-1"), _generated("sig-2")])
+    store = client.app.state.store
+
+    first_run = client.post("/api/runs", json={"mr_url": "https://x/7"}).json()
+    by_sig = {f["signature"]: f for f in store.list_findings(first_run["run_id"])}
+    client.patch(
+        "/api/findings/%d" % by_sig["sig-1"]["id"],
+        json={"state": "kept", "edited_body": "my wording"},
+    )
+    client.patch(
+        "/api/findings/%d" % by_sig["sig-2"]["id"], json={"state": "discarded"}
+    )
+
+    _stub_generate(
+        monkeypatch,
+        [_generated("sig-1", "regenerated"), _generated("sig-2", "regenerated")],
+        head_sha="sha-2",
+    )
+    second_run = client.post("/api/runs", json={"mr_url": "https://x/7"}).json()
+
+    assert second_run["run_id"] == first_run["run_id"]
+    after = {f["signature"]: f for f in store.list_findings(second_run["run_id"])}
+    assert after["sig-1"]["state"] == "kept"
+    assert after["sig-1"]["edited_body"] == "my wording"
+    assert after["sig-2"]["state"] == "discarded"
+    assert store.get_run(second_run["run_id"])["head_sha"] == "sha-2"
+
+
+def test_run_persists_and_returns_the_test_summary(client, monkeypatch):
+    """Test-coverage findings must reach the reviewer, not be dropped."""
+    summary = {"uncovered": ["a.py::parse"], "note": "add a regression test"}
+    _stub_generate(monkeypatch, [_generated("sig-1")], test_summary=summary)
+
+    run_id = client.post("/api/runs", json={"mr_url": "https://x/7"}).json()["run_id"]
+
+    class FakeClient:
+        def get_mr_diff(self, project_path, mr_iid):
+            return {"files": []}
+
+    monkeypatch.setattr("sensei_ui.app.engine.make_client", lambda url: FakeClient())
+
+    body = client.get("/api/runs/%d" % run_id).json()
+
+    assert body["test_summary"] == summary
+    assert body["run"]["test_summary"] == summary
+
+
+def test_patch_rejects_client_supplied_posted_state(client):
+    """Only mark_posted may set `posted`; a fabricated one breaks undo."""
+    store = client.app.state.store
+    run_id = store.get_or_create_run("g/p", 7, "https://x/7", "abc")
+    store.upsert_findings(run_id, [{
+        "signature": "inline|a.py|1", "file": "a.py", "line": 1,
+        "kind": "must", "confidence": 90, "original_body": "b",
+        "verdict": None, "verdict_reason": None,
+    }])
+    finding_id = store.list_findings(run_id)[0]["id"]
+
+    response = client.patch(
+        "/api/findings/%d" % finding_id, json={"state": "posted"}
+    )
+
+    assert response.status_code == 422
+    after = store.list_findings(run_id)[0]
+    assert after["state"] == "pending"
+    assert after["discussion_id"] is None
+
+
+def _seed_postable_run(client, states):
+    store = client.app.state.store
+    run_id = store.get_or_create_run("g/p", 7, "https://x/7", "same-sha")
+    store.upsert_findings(run_id, [
+        {
+            "signature": "inline|a.py|1#%s" % state, "file": "a.py", "line": 1,
+            "kind": "must", "confidence": 90, "original_body": state,
+            "verdict": None, "verdict_reason": None,
+        }
+        for state in states
+    ])
+    for finding in store.list_findings(run_id):
+        store.update_finding(finding["id"], state=finding["original_body"])
+    return run_id
+
+
+class _MatchingHeadClient:
+    def get_mr_diff(self, project_path, mr_iid):
+        return {
+            "files": [{"new_path": "a.py",
+                       "diff": "@@ -1,1 +1,2 @@\n ctx\n+added\n"}],
+            "base_sha": "b", "head_sha": "same-sha", "start_sha": "s",
+        }
+
+    def get_existing_comments(self, project_path, mr_iid):
+        return set()
+
+
+def test_only_kept_findings_are_planned_for_posting(client, monkeypatch):
+    """The kept filter is the last gate before a colleague's merge request."""
+    run_id = _seed_postable_run(client, ["pending", "discarded", "kept"])
+    monkeypatch.setattr(
+        "sensei_ui.app.engine.make_client", lambda url: _MatchingHeadClient()
+    )
+
+    captured = {}
+
+    def fake_post_planned(client_arg, project_path, mr_iid, diff_refs, planned, on_posted):
+        captured["planned"] = planned
+        return {"posted": 0, "skipped": 0}
+
+    monkeypatch.setattr("sensei_ui.app.engine.post_planned", fake_post_planned)
+
+    assert client.post("/api/runs/%d/post" % run_id).status_code == 200
+
+    planned = captured["planned"]
+    bodies = [e["original_body"]
+              for e in planned["inline"] + planned["summary"] + planned["skipped"]]
+    assert bodies == ["kept"]
+
+
+def test_concurrent_posts_produce_exactly_one_set_of_posts(client, monkeypatch):
+    """A double-clicked Post must not double-post to someone else's MR."""
+    import threading
+    import time
+
+    run_id = _seed_postable_run(client, ["kept"])
+    monkeypatch.setattr(
+        "sensei_ui.app.engine.make_client", lambda url: _MatchingHeadClient()
+    )
+
+    entered = threading.Event()
+    planned_counts = []
+
+    def fake_post_planned(client_arg, project_path, mr_iid, diff_refs, planned, on_posted):
+        entries = planned["inline"] + planned["summary"]
+        planned_counts.append(len(entries))
+        entered.set()
+        time.sleep(0.2)
+        for entry in entries:
+            on_posted(entry, "disc-%d" % entry["id"])
+        return {"posted": len(entries), "skipped": len(planned["skipped"])}
+
+    monkeypatch.setattr("sensei_ui.app.engine.post_planned", fake_post_planned)
+
+    results = []
+
+    def fire():
+        results.append(client.post("/api/runs/%d/post" % run_id).json())
+
+    first = threading.Thread(target=fire)
+    first.start()
+    entered.wait(timeout=5)
+    second = threading.Thread(target=fire)
+    second.start()
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    assert sum(r["posted"] for r in results) == 1
+    assert sorted(planned_counts) == [0, 1]

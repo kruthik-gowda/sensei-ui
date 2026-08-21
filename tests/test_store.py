@@ -23,8 +23,8 @@ def _finding(signature, body="original text"):
     }
 
 
-def test_create_run_returns_id_and_round_trips(store):
-    run_id = store.create_run("g/p", 7, "https://x/7", "abc123")
+def test_get_or_create_run_returns_id_and_round_trips(store):
+    run_id = store.get_or_create_run("g/p", 7, "https://x/7", "abc123")
     run = store.get_run(run_id)
 
     assert run["mr_iid"] == 7
@@ -34,7 +34,7 @@ def test_create_run_returns_id_and_round_trips(store):
 
 
 def test_upsert_inserts_findings_as_pending(store):
-    run_id = store.create_run("g/p", 7, "https://x/7", "abc123")
+    run_id = store.get_or_create_run("g/p", 7, "https://x/7", "abc123")
     store.upsert_findings(run_id, [_finding("sig-1")])
 
     findings = store.list_findings(run_id)
@@ -45,7 +45,7 @@ def test_upsert_inserts_findings_as_pending(store):
 
 def test_reupsert_preserves_edited_body_and_state(store):
     """The core requirement: a regenerating re-run must not erase decisions."""
-    run_id = store.create_run("g/p", 7, "https://x/7", "abc123")
+    run_id = store.get_or_create_run("g/p", 7, "https://x/7", "abc123")
     store.upsert_findings(run_id, [_finding("sig-1")])
 
     finding_id = store.list_findings(run_id)[0]["id"]
@@ -61,7 +61,7 @@ def test_reupsert_preserves_edited_body_and_state(store):
 
 
 def test_reupsert_adds_new_findings_without_touching_old(store):
-    run_id = store.create_run("g/p", 7, "https://x/7", "abc123")
+    run_id = store.get_or_create_run("g/p", 7, "https://x/7", "abc123")
     store.upsert_findings(run_id, [_finding("sig-1")])
     store.update_finding(store.list_findings(run_id)[0]["id"], None, "kept")
 
@@ -73,7 +73,7 @@ def test_reupsert_adds_new_findings_without_touching_old(store):
 
 
 def test_mark_posted_records_discussion_id(store):
-    run_id = store.create_run("g/p", 7, "https://x/7", "abc123")
+    run_id = store.get_or_create_run("g/p", 7, "https://x/7", "abc123")
     store.upsert_findings(run_id, [_finding("sig-1")])
     finding_id = store.list_findings(run_id)[0]["id"]
 
@@ -83,3 +83,46 @@ def test_mark_posted_records_discussion_id(store):
     assert posted["state"] == "posted"
     assert posted["discussion_id"] == "disc-abc"
     assert posted["posted_at"] is not None
+
+
+def test_get_or_create_run_reuses_the_row_for_one_merge_request(store):
+    """A merge request owns one run row, so decisions keyed on it survive."""
+    first = store.get_or_create_run("g/p", 7, "https://x/7", "sha-one")
+    second = store.get_or_create_run("g/p", 7, "https://x/7", "sha-two")
+
+    assert first == second
+    run = store.get_run(first)
+    assert run["head_sha"] == "sha-two"
+    assert run["status"] == "running"
+    assert run["verify_status"] == "skipped"
+
+
+def test_get_or_create_run_separates_different_merge_requests(store):
+    first = store.get_or_create_run("g/p", 7, "https://x/7", "sha")
+    other_mr = store.get_or_create_run("g/p", 8, "https://x/8", "sha")
+    other_project = store.get_or_create_run("g/q", 7, "https://y/7", "sha")
+
+    assert len({first, other_mr, other_project}) == 3
+
+
+def test_reused_run_keeps_posted_findings_posted(store):
+    run_id = store.get_or_create_run("g/p", 7, "https://x/7", "sha-one")
+    store.upsert_findings(run_id, [_finding("sig-1")])
+    store.mark_posted(store.list_findings(run_id)[0]["id"], "disc-1")
+
+    store.get_or_create_run("g/p", 7, "https://x/7", "sha-two")
+    store.upsert_findings(run_id, [_finding("sig-1", body="regenerated")])
+
+    after = store.list_findings(run_id)[0]
+    assert after["state"] == "posted"
+    assert after["discussion_id"] == "disc-1"
+
+
+def test_set_run_test_summary_round_trips(store):
+    run_id = store.get_or_create_run("g/p", 7, "https://x/7", "sha")
+
+    assert store.get_run(run_id)["test_summary"] is None
+
+    store.set_run_test_summary(run_id, '{"covered": 3}')
+
+    assert store.get_run(run_id)["test_summary"] == '{"covered": 3}'
