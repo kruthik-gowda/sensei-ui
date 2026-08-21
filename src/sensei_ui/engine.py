@@ -108,3 +108,105 @@ def make_client(mr_url: str):
     config = load_config()
     parse_review_url(mr_url)
     return GitLabClient(config["gitlab_url"], config["gitlab_pat"])
+
+
+def _deserialise_signature(signature: str):
+    parts = signature.split("|")
+    if parts[0] == "inline":
+        return ("inline", parts[1], int(parts[2]))
+    return ("body", "|".join(parts[1:]))
+
+
+def _body_of(finding: Dict) -> str:
+    return finding.get("edited_body") or finding["original_body"]
+
+
+def plan_posts(
+    findings: List[Dict], diff_lines_map: Dict[str, set], existing: set
+) -> Dict:
+    """Decide each finding's destination without touching the network."""
+    inline, summary, skipped = [], [], []
+
+    for finding in findings:
+        signature = _deserialise_signature(finding["signature"])
+        if signature in existing:
+            skipped.append(finding)
+            continue
+
+        entry = dict(finding)
+        entry["body"] = _body_of(finding)
+
+        line = finding.get("line")
+        on_diff = bool(line) and line in diff_lines_map.get(finding["file"], set())
+
+        if finding["kind"] == "must" and on_diff:
+            inline.append(entry)
+        else:
+            summary.append(entry)
+
+    return {"inline": inline, "summary": summary, "skipped": skipped}
+
+
+def post_planned(
+    client,
+    project_path: str,
+    mr_iid: int,
+    diff_refs: Dict,
+    planned: Dict,
+    on_posted,
+) -> Dict:
+    """Post planned findings, reporting each success as it happens.
+
+    Posting goes through python-gitlab directly rather than sensei's
+    `post_inline_comment`, which discards the created discussion — undo and
+    partial-failure recovery both need its id.
+    """
+    from sensei.formatter import format_inline_comment, format_nits_summary
+
+    project = client.gl.projects.get(project_path)
+    mr = project.mergerequests.get(mr_iid)
+    posted = 0
+
+    for entry in planned["inline"]:
+        discussion = mr.discussions.create(
+            {
+                "body": format_inline_comment(entry),
+                "position": {
+                    "base_sha": diff_refs["base_sha"],
+                    "head_sha": diff_refs["head_sha"],
+                    "start_sha": diff_refs["start_sha"],
+                    "position_type": "text",
+                    "new_path": entry["file"],
+                    "new_line": entry["line"],
+                },
+            }
+        )
+        on_posted(entry, str(discussion.id))
+        posted += 1
+
+    if planned["summary"]:
+        note = mr.notes.create({"body": format_nits_summary(planned["summary"])})
+        for entry in planned["summary"]:
+            on_posted(entry, "note-%s" % note.id)
+            posted += 1
+
+    return {"posted": posted, "skipped": len(planned["skipped"])}
+
+
+def delete_discussions(client, project_path: str, mr_iid: int, ids: List[str]) -> int:
+    """Undo: remove threads and notes this app created."""
+    project = client.gl.projects.get(project_path)
+    mr = project.mergerequests.get(mr_iid)
+    removed = 0
+
+    for discussion_id in ids:
+        if discussion_id.startswith("note-"):
+            mr.notes.delete(int(discussion_id[len("note-"):]))
+            removed += 1
+            continue
+        discussion = mr.discussions.get(discussion_id)
+        for note in discussion.attributes["notes"]:
+            discussion.notes.delete(note["id"])
+        removed += 1
+
+    return removed
