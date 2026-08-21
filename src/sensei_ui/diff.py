@@ -33,7 +33,13 @@ def parse_diff(diff_text: str) -> List[Dict]:
     if not diff_text or not diff_text.strip():
         return []
 
-    patch = PatchSet(diff_text)
+    text = diff_text
+    if not text.lstrip().startswith("---"):
+        # GitLab's per-file `diff` field is hunks only, with no `---`/`+++`
+        # file header lines; unidiff requires one to anchor a PatchedFile.
+        text = "--- a/file\n+++ b/file\n" + text
+
+    patch = PatchSet(text)
     rows: List[Dict] = []
 
     for patched_file in patch:

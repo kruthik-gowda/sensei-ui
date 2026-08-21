@@ -215,3 +215,5 @@ def delete_discussions(client, project_path: str, mr_iid: int, ids: List[str]) -
         removed += 1
 
     return removed
+
+from sensei.gitlab_client import extract_diff_lines  # noqa: E402,F401
