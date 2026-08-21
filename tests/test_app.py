@@ -110,15 +110,28 @@ def test_posting_blocked_when_run_is_stale(client, monkeypatch):
 
     class FakeClient:
         def get_mr_diff(self, project_path, mr_iid):
-            return {"files": [], "base_sha": "b", "head_sha": "new-sha",
-                     "start_sha": "s"}
+            return {
+                "files": [{"new_path": "a.py",
+                           "diff": "@@ -1,1 +1,2 @@\n ctx\n+added\n"}],
+                "base_sha": "b", "head_sha": "new-sha", "start_sha": "s",
+            }
+
+        def get_existing_comments(self, project_path, mr_iid):
+            return set()
 
     monkeypatch.setattr("sensei_ui.app.engine.make_client", lambda url: FakeClient())
+
+    post_planned_calls = []
+    monkeypatch.setattr(
+        "sensei_ui.app.engine.post_planned",
+        lambda *args, **kwargs: post_planned_calls.append((args, kwargs)),
+    )
 
     response = client.post("/api/runs/%d/post" % run_id)
 
     assert response.status_code == 409
     assert "stale" in response.json()["detail"].lower()
+    assert post_planned_calls == []
 
 
 def test_posting_proceeds_when_head_matches(client, monkeypatch):
@@ -136,7 +149,11 @@ def test_posting_proceeds_when_head_matches(client, monkeypatch):
     store.update_finding(finding_id, state="kept")
 
     class FakeClient:
+        def __init__(self):
+            self.get_mr_diff_calls = 0
+
         def get_mr_diff(self, project_path, mr_iid):
+            self.get_mr_diff_calls += 1
             return {
                 "files": [{"new_path": "a.py",
                            "diff": "@@ -1,1 +1,2 @@\n ctx\n+added\n"}],
@@ -146,7 +163,8 @@ def test_posting_proceeds_when_head_matches(client, monkeypatch):
         def get_existing_comments(self, project_path, mr_iid):
             return set()
 
-    monkeypatch.setattr("sensei_ui.app.engine.make_client", lambda url: FakeClient())
+    fake_client = FakeClient()
+    monkeypatch.setattr("sensei_ui.app.engine.make_client", lambda url: fake_client)
 
     captured = {}
 
@@ -165,3 +183,4 @@ def test_posting_proceeds_when_head_matches(client, monkeypatch):
     assert captured["diff_refs"] == {
         "base_sha": "b", "head_sha": "same-sha", "start_sha": "s",
     }
+    assert fake_client.get_mr_diff_calls == 1

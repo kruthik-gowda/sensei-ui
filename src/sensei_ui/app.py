@@ -22,17 +22,6 @@ class RunRequest(BaseModel):
     mr_url: str
 
 
-def current_head_sha(mr_url: str) -> str:
-    """Live head SHA, so staleness can be detected at post time."""
-    client = engine.make_client(mr_url)
-    target = engine.parse_review_url(mr_url)
-    mr_data = client.get_mr_diff(
-        str(target["project_path"]), int(target["review_id"])
-    )
-    # get_mr_diff returns base_sha/head_sha/start_sha flat, not nested.
-    return mr_data["head_sha"]
-
-
 def create_app(store: Optional[Store] = None) -> FastAPI:
     app = FastAPI(title="sensei-ui")
     app.state.store = store or Store(DB_PATH)
